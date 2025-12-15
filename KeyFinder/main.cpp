@@ -66,6 +66,7 @@ static RunConfig _config;
 std::vector<DeviceManager::DeviceInfo> _devices;
 
 void writeCheckpoint(secp256k1::uint256 nextKey);
+void writeCheckpoint(secp256k1::uint256 nextKey, const std::string &checkpointFile, secp256k1::uint256 startKey, secp256k1::uint256 endKey);
 
 static uint64_t _lastUpdate = 0;
 static uint64_t _runningTime = 0;
@@ -75,6 +76,12 @@ static uint64_t _startTime = 0;
 static std::mutex _resultMutex;
 static std::mutex _statusMutex;
 static std::mutex _checkpointMutex;
+
+// Phase 5: Per-GPU checkpoint tracking (thread-local storage)
+static thread_local std::string _threadCheckpointFile;
+static thread_local secp256k1::uint256 _threadStartKey;
+static thread_local secp256k1::uint256 _threadEndKey;
+static thread_local uint64_t _threadLastUpdate = 0;
 
 /**
 * Callback to display the private key (thread-safe for multi-GPU)
@@ -154,12 +161,22 @@ void statusCallback(KeySearchStatus info)
 
 	printf(formatStr, devName.c_str(), usedMemStr.c_str(), totalMemStr.c_str(), targetStr.c_str(), speedStr.c_str(), totalStr.c_str(), timeStr.c_str());
 
-    if(_config.checkpointFile.length() > 0) {
+    // Phase 5: Check for per-GPU checkpoint (multi-GPU mode) or global checkpoint (single-GPU mode)
+    std::string checkpointFile = _threadCheckpointFile.empty() ? _config.checkpointFile : _threadCheckpointFile;
+    uint64_t *lastUpdate = _threadCheckpointFile.empty() ? &_lastUpdate : &_threadLastUpdate;
+
+    if(checkpointFile.length() > 0) {
         uint64_t t = util::getSystemTime();
-        if(t - _lastUpdate >= _config.checkpointInterval) {
-            Logger::log(LogLevel::Info, "Checkpoint");
-            writeCheckpoint(info.nextKey);
-            _lastUpdate = t;
+        if(t - *lastUpdate >= _config.checkpointInterval) {
+            Logger::log(LogLevel::Info, "Checkpoint: " + checkpointFile);
+            if(_threadCheckpointFile.empty()) {
+                // Single GPU mode - use global config
+                writeCheckpoint(info.nextKey);
+            } else {
+                // Multi-GPU mode - use per-GPU config
+                writeCheckpoint(info.nextKey, _threadCheckpointFile, _threadStartKey, _threadEndKey);
+            }
+            *lastUpdate = t;
         }
     }
 }
@@ -389,6 +406,25 @@ void writeCheckpoint(secp256k1::uint256 nextKey)
     tmp.close();
 }
 
+// Phase 5: Per-GPU checkpoint write function
+void writeCheckpoint(secp256k1::uint256 nextKey, const std::string &checkpointFile, secp256k1::uint256 startKey, secp256k1::uint256 endKey)
+{
+    std::lock_guard<std::mutex> lock(_checkpointMutex);
+
+    std::ofstream tmp(checkpointFile, std::ios::out);
+
+    tmp << "start=" << startKey.toString() << std::endl;
+    tmp << "next=" << nextKey.toString() << std::endl;
+    tmp << "end=" << endKey.toString() << std::endl;
+    tmp << "blocks=" << _config.blocks << std::endl;
+    tmp << "threads=" << _config.threads << std::endl;
+    tmp << "points=" << _config.pointsPerThread << std::endl;
+    tmp << "compression=" << getCompressionString(_config.compression) << std::endl;
+    tmp << "elapsed=" << (util::getSystemTime() - _startTime) << std::endl;
+    tmp << "stride=" << _config.stride.toString();
+    tmp.close();
+}
+
 void readCheckpointFile()
 {
     if(_config.checkpointFile.length() == 0) {
@@ -431,6 +467,44 @@ void readCheckpointFile()
     _config.totalkeys = (_config.nextKey - _config.startKey).toUint64();
 }
 
+// Phase 5: Per-GPU checkpoint read function
+bool readCheckpointFileForGPU(const std::string &checkpointFile, secp256k1::uint256 &startKey, secp256k1::uint256 &nextKey, secp256k1::uint256 &endKey)
+{
+    if(checkpointFile.length() == 0) {
+        return false;
+    }
+
+    ConfigFileReader reader(checkpointFile);
+
+    if(!reader.exists()) {
+        return false;
+    }
+
+    Logger::log(LogLevel::Info, "Loading GPU checkpoint: " + checkpointFile);
+
+    std::map<std::string, ConfigFileEntry> entries = reader.read();
+
+    startKey = secp256k1::uint256(entries["start"].value);
+    nextKey = secp256k1::uint256(entries["next"].value);
+    endKey = secp256k1::uint256(entries["end"].value);
+
+    // Load global config if not already set
+    if(_config.threads == 0 && entries.find("threads") != entries.end()) {
+        _config.threads = util::parseUInt32(entries["threads"].value);
+    }
+    if(_config.blocks == 0 && entries.find("blocks") != entries.end()) {
+        _config.blocks = util::parseUInt32(entries["blocks"].value);
+    }
+    if(_config.pointsPerThread == 0 && entries.find("points") != entries.end()) {
+        _config.pointsPerThread = util::parseUInt32(entries["points"].value);
+    }
+    if(entries.find("stride") != entries.end()) {
+        _config.stride = util::parseUInt64(entries["stride"].value);
+    }
+
+    return true;
+}
+
 /**
  * Phase 5: Multi-GPU runner function
  * Partitions keyspace across multiple GPUs and runs them in parallel
@@ -445,8 +519,33 @@ struct GPUWorkerContext {
 void gpuWorkerThread(GPUWorkerContext ctx)
 {
     try {
-        Logger::log(LogLevel::Info, "GPU " + util::format(ctx.deviceId) + " starting: " +
-                    ctx.startKey.toString() + " to " + ctx.endKey.toString());
+        // Phase 5: Set thread-local checkpoint file and keyspace for this GPU
+        _threadCheckpointFile = ctx.checkpointFile;
+        _threadStartKey = ctx.startKey;
+        _threadEndKey = ctx.endKey;
+        _threadLastUpdate = util::getSystemTime();
+
+        // Phase 5: Try to resume from per-GPU checkpoint if it exists
+        secp256k1::uint256 resumeStartKey = ctx.startKey;
+        secp256k1::uint256 resumeNextKey = ctx.startKey;
+        secp256k1::uint256 resumeEndKey = ctx.endKey;
+
+        if(!ctx.checkpointFile.empty()) {
+            if(readCheckpointFileForGPU(ctx.checkpointFile, resumeStartKey, resumeNextKey, resumeEndKey)) {
+                // Update thread-local keys with checkpoint values
+                _threadStartKey = resumeStartKey;
+                _threadEndKey = resumeEndKey;
+
+                Logger::log(LogLevel::Info, "GPU " + util::format(ctx.deviceId) + " resuming from: " +
+                            resumeNextKey.toString() + " to " + resumeEndKey.toString());
+            } else {
+                Logger::log(LogLevel::Info, "GPU " + util::format(ctx.deviceId) + " starting fresh: " +
+                            ctx.startKey.toString() + " to " + ctx.endKey.toString());
+            }
+        } else {
+            Logger::log(LogLevel::Info, "GPU " + util::format(ctx.deviceId) + " starting: " +
+                        ctx.startKey.toString() + " to " + ctx.endKey.toString());
+        }
 
         // Get default parameters for this device
         DeviceParameters params = getDefaultParameters(_devices[ctx.deviceId]);
@@ -458,8 +557,8 @@ void gpuWorkerThread(GPUWorkerContext ctx)
         // Get device context
         KeySearchDevice *d = getDeviceContext(_devices[ctx.deviceId], blocks, threads, pointsPerThread);
 
-        // Create KeyFinder with partitioned keyspace
-        KeyFinder f(ctx.startKey, ctx.endKey, _config.compression, d, _config.stride);
+        // Create KeyFinder with partitioned keyspace (use resumeNextKey for actual start)
+        KeyFinder f(resumeNextKey, resumeEndKey, _config.compression, d, _config.stride);
 
         f.setResultCallback(resultCallback);
         f.setStatusInterval(_config.statusInterval);
